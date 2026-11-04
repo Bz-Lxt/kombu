@@ -485,6 +485,7 @@ class Consumer:
         on_message (Callable): See :attr:`on_message`
         on_decode_error (Callable): see :attr:`on_decode_error`.
         prefetch_count (int): see :attr:`prefetch_count`.
+        max_decompression_size (int): see :attr:`max_decompression_size`.
     """
 
     ContentDisallowed = ContentDisallowed
@@ -555,6 +556,22 @@ class Consumer:
     #: Can also be changed using :meth:`qos`.
     prefetch_count = None
 
+    #: Maximum decompressed size (in bytes) accepted for a single message.
+    #:
+    #: When set to a positive integer, compressed messages are decompressed
+    #: incrementally while being received: a message whose decompressed body
+    #: would exceed this size is rejected during decompression (together with
+    #: corrupt messages and messages using a compression method that cannot
+    #: enforce the limit) and handled by :attr:`on_decode_error`.  The
+    #: original compressed body is left untouched, so rejecting or
+    #: requeuing such a message returns it unchanged.
+    #:
+    #: The limit is per consumer: consumers sharing a connection (or a
+    #: channel) can each configure their own value.  :const:`None` (the
+    #: default) disables the limit and preserves the unrestricted
+    #: decompression behavior.
+    max_decompression_size = None
+
     #: Mapping of queues we consume from.
     _queues = None
 
@@ -562,7 +579,8 @@ class Consumer:
 
     def __init__(self, channel, queues=None, no_ack=None, auto_declare=None,
                  callbacks=None, on_decode_error=None, on_message=None,
-                 accept=None, prefetch_count=None, tag_prefix=None):
+                 accept=None, prefetch_count=None, tag_prefix=None,
+                 max_decompression_size=None):
         self.channel = channel
         self.queues = maybe_list(queues or [])
         self.no_ack = self.no_ack if no_ack is None else no_ack
@@ -578,9 +596,20 @@ class Consumer:
             self.on_decode_error = on_decode_error
         self.accept = prepare_accept_content(accept)
         self.prefetch_count = prefetch_count
+        if max_decompression_size is not None:
+            self.max_decompression_size = \
+                self._prepare_max_decompression_size(max_decompression_size)
 
         if self.channel:
             self.revive(self.channel)
+
+    @staticmethod
+    def _prepare_max_decompression_size(value):
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or value <= 0):
+            raise ValueError(
+                'max_decompression_size must be a positive integer or None')
+        return value
 
     @property
     def queues(self):  # noqa
@@ -593,6 +622,7 @@ class Consumer:
     def revive(self, channel):
         """Revive consumer after connection loss."""
         previous_no_ack = self._active_queue_no_ack.copy()
+        self._clear_decompression_limits()
         self._active_tags.clear()
         self._active_queue_no_ack.clear()
         channel = self.channel = maybe_channel(channel)
@@ -727,6 +757,7 @@ class Consumer:
         cancel = self.channel.basic_cancel
         for tag in self._active_tags.values():
             cancel(tag)
+        self._clear_decompression_limits()
         self._active_tags.clear()
         self._active_queue_no_ack.clear()
 
@@ -742,6 +773,7 @@ class Consumer:
             pass
         else:
             self.channel.basic_cancel(tag)
+            self._remove_decompression_limit(tag)
         finally:
             self._queues.pop(qname, None)
 
@@ -845,9 +877,33 @@ class Consumer:
             no_ack = queue.no_ack if no_ack is None else no_ack
             tag = self._add_tag(queue, consumer_tag)
             self._active_queue_no_ack[queue.name] = no_ack
+            self._register_decompression_limit(tag)
             queue.consume(tag, self._receive_callback,
                           no_ack=no_ack, nowait=nowait)
         return tag
+
+    def _register_decompression_limit(self, tag):
+        max_size = self.max_decompression_size
+        if max_size is None or self.channel is None:
+            return
+        limits = getattr(self.channel, 'consumer_decompression_limits', None)
+        if limits is None:
+            limits = {}
+            self.channel.consumer_decompression_limits = limits
+        limits[tag] = max_size
+
+    def _remove_decompression_limit(self, tag):
+        limits = getattr(self.channel, 'consumer_decompression_limits', None)
+        if limits is not None:
+            limits.pop(tag, None)
+
+    def _clear_decompression_limits(self):
+        if self.channel is None:
+            return
+        limits = getattr(self.channel, 'consumer_decompression_limits', None)
+        if limits is not None:
+            for tag in self._active_tags.values():
+                limits.pop(tag, None)
 
     def _add_tag(self, queue, consumer_tag=None):
         tag = consumer_tag or '{}{}'.format(

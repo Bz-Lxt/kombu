@@ -61,6 +61,22 @@ class test_Channel:
         message.properties = {}
         assert self.channel.message_to_python(message)
 
+    def test_message_to_python_resolves_decompression_limit_by_tag(self):
+        self.channel.consumer_decompression_limits = {'ctag': 42}
+        raw_message = Mock(name='raw_message')
+        raw_message.delivery_info = {'consumer_tag': 'ctag'}
+        self.channel.Message = Mock(name='Message')
+
+        self.channel.message_to_python(raw_message)
+        assert (self.channel.Message.call_args
+                .kwargs['max_decompression_size']) == 42
+
+        # a consumer without a registered limit gets None (legacy path)
+        raw_message.delivery_info = {'consumer_tag': 'other'}
+        self.channel.message_to_python(raw_message)
+        assert (self.channel.Message.call_args
+                .kwargs['max_decompression_size']) is None
+
     def test_close_resolves_connection_cycle(self):
         assert self.channel.connection is not None
         self.channel.close()

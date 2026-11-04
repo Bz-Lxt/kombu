@@ -348,8 +348,12 @@ class Message(base.Message):
         body, _ = self.channel.encode_body(self.body,
                                            props.get('body_encoding'))
         headers = dict(self.headers)
-        # remove compression header
-        headers.pop('compression', None)
+        if self._decompressed:
+            # The body now holds decompressed data, so the compression
+            # header must not follow it back onto the queue.  When the
+            # body was never decompressed (e.g. decompression failed) the
+            # original compressed body and its header are preserved.
+            headers.pop('compression', None)
         return {
             'body': body,
             'properties': props,
@@ -480,6 +484,9 @@ class Channel(AbstractChannel, base.StdChannel):
         self._active_queues = []
         self._qos = None
         self.closed = False
+        # Mapping of consumer tag -> max decompressed body size for
+        # consumers that enabled a per-consumer decompression limit.
+        self.consumer_decompression_limits = {}
 
         # instantiate exchange types
         self.exchange_types = {
@@ -640,7 +647,12 @@ class Channel(AbstractChannel, base.StdChannel):
         self._active_queues.append(queue)
 
         def _callback(raw_message):
-            message = self.Message(raw_message, channel=self)
+            max_decompression_size = (
+                self.consumer_decompression_limits.get(consumer_tag))
+            message = self.Message(
+                raw_message, channel=self,
+                max_decompression_size=max_decompression_size,
+            )
             if not no_ack:
                 self.qos.append(message, message.delivery_tag)
             return callback(message)
@@ -654,6 +666,7 @@ class Channel(AbstractChannel, base.StdChannel):
         """Cancel consumer by consumer tag."""
         if consumer_tag in self._consumers:
             self._consumers.remove(consumer_tag)
+            self.consumer_decompression_limits.pop(consumer_tag, None)
             queue = self._tag_to_queue.pop(consumer_tag, None)
             try:
                 self._active_queues.remove(queue)

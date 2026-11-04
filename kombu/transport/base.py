@@ -82,6 +82,13 @@ class StdChannel:
 
     no_ack_consumers = None
 
+    #: Optional mapping of consumer tags to the maximum decompressed
+    #: body size accepted by that consumer.  Consumers populate this when
+    #: configured with a per-consumer decompression limit; transports
+    #: consult it (by consumer tag) while building received messages.
+    #: :const:`None` means no per-consumer limits are registered.
+    consumer_decompression_limits = None
+
     def Consumer(self, *args, **kwargs):
         from kombu.messaging import Consumer
         return Consumer(self, *args, **kwargs)

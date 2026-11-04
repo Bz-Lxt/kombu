@@ -140,6 +140,49 @@ class test_Message:
         assert dict_['properties']['delivery_tag'] == tag
         assert 'compression' not in dict_['headers']
 
+    def test_serializable_preserves_compressed_body_on_failure(self):
+        c = client().channel()
+        raw_body, content_type = compress(b'x' * 10000, 'gzip')
+        data = c.prepare_message(raw_body,
+                                 headers={'compression': content_type})
+        data['properties']['delivery_tag'] = uuid()
+        # decompression fails because of the configured limit ...
+        message = virtual.Message(data, channel=c,
+                                  max_decompression_size=64)
+        assert message.errors
+        assert message.body == raw_body
+        assert message._decompressed is False
+
+        # ... serializing it returns the original compressed payload with
+        # the compression header still attached ...
+        dict_ = message.serializable()
+        assert dict_['body'] == raw_body
+        assert dict_['headers']['compression'] == content_type
+
+        # ... so redelivering it (without a limit) decodes normally.
+        redelivered = c.message_to_python(dict_)
+        assert not redelivered.errors
+        assert redelivered.body == b'x' * 10000
+
+    def test_basic_consume_applies_consumer_decompression_limit(self):
+        c = memory_client().channel()
+        raw_body, content_type = compress(b'x' * 10000, 'gzip')
+        data = c.prepare_message(raw_body,
+                                 headers={'compression': content_type})
+
+        received = []
+        c.basic_consume('foo', False, callback=received.append,
+                        consumer_tag='ctag')
+        c.consumer_decompression_limits['ctag'] = 64
+        data['properties']['delivery_tag'] = uuid()
+        c.connection._deliver(data, 'foo')
+
+        assert len(received) == 1
+        message = received[0]
+        assert message.errors
+        assert message.body == raw_body
+        assert message._decompressed is False
+
 
 class test_AbstractChannel:
 

@@ -145,7 +145,13 @@ class Channel(amqp.Channel, base.StdChannel):
 
     def message_to_python(self, raw_message):
         """Convert encoded message body back to a Python value."""
-        return self.Message(raw_message, channel=self)
+        max_decompression_size = None
+        limits = self.consumer_decompression_limits
+        if limits:
+            max_decompression_size = limits.get(
+                raw_message.delivery_info.get('consumer_tag'))
+        return self.Message(raw_message, channel=self,
+                            max_decompression_size=max_decompression_size)
 
 
 class Connection(amqp.Connection):

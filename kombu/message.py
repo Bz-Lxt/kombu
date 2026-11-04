@@ -45,6 +45,13 @@ class Message:
         properties (Dict): Message properties.
 
         headers (Dict): Message headers.
+
+        max_decompression_size (int): When set to a positive integer,
+            a compressed message body is decompressed incrementally and
+            decompression fails (storing the error on the message) when
+            the decompressed payload would exceed this many bytes.
+            :const:`None` (the default) decompresses the whole body
+            without a limit.
     """
 
     MessageStateError = MessageStateError
@@ -56,13 +63,15 @@ class Message:
             '_state', 'channel', 'delivery_tag',
             'content_type', 'content_encoding',
             'delivery_info', 'headers', 'properties',
-            'body', '_decoded_cache', 'accept', '__dict__',
+            'body', '_decoded_cache', 'accept', '_decompressed',
+            '__dict__',
         )
 
     def __init__(self, body=None, delivery_tag=None,
                  content_type=None, content_encoding=None, delivery_info=None,
                  properties=None, headers=None, postencode=None,
-                 accept=None, channel=None, **kwargs):
+                 accept=None, channel=None, max_decompression_size=None,
+                 **kwargs):
         delivery_info = {} if not delivery_info else delivery_info
         self.errors = [] if self.errors is None else self.errors
         self.channel = channel
@@ -75,13 +84,21 @@ class Message:
         self._decoded_cache = None
         self._state = 'RECEIVED'
         self.accept = accept
+        # Whether ``body`` currently holds decompressed data.  When
+        # decompression is skipped or fails the body remains the original
+        # (compressed) payload as received, so it can be returned to the
+        # broker unchanged.
+        self._decompressed = False
 
         compression = self.headers.get('compression')
         if not self.errors and compression:
             try:
-                body = decompress(body, compression)
+                body = decompress(
+                    body, compression, max_size=max_decompression_size)
             except Exception:
                 self.errors.append(sys.exc_info())
+            else:
+                self._decompressed = True
 
         if not self.errors and postencode and isinstance(body, str):
             try:

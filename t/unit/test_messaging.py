@@ -9,7 +9,10 @@ from unittest.mock import ANY, Mock, patch
 import pytest
 
 from kombu import Connection, Consumer, Exchange, Producer, Queue
-from kombu.exceptions import MessageStateError, OperationalError
+from kombu.compression import compress
+from kombu.exceptions import (
+    LimitExceeded, MessageStateError, OperationalError,
+)
 from kombu.utils import json
 from kombu.utils.functional import ChannelPromise
 from t.mocks import Transport
@@ -1170,3 +1173,130 @@ class test_Consumer:
         p = self.connection.Consumer()
         p.channel = object()
         assert p.connection is None
+
+    def test_max_decompression_size__default(self):
+        consumer = Consumer(self.connection)
+        assert consumer.max_decompression_size is None
+
+    @pytest.mark.parametrize('value', [0, -1, True, '1024', 1.5])
+    def test_max_decompression_size__invalid(self, value):
+        with pytest.raises(ValueError):
+            Consumer(self.connection, max_decompression_size=value)
+
+    def test_max_decompression_size__registered_per_consumer_tag(self):
+        channel = self.connection.channel()
+        queue = Queue('qname', self.exchange, 'rkey')
+        consumer = Consumer(channel, queue,
+                            max_decompression_size=4096, auto_declare=False)
+        consumer.consume()
+        tag = consumer._active_tags[queue.name]
+        assert channel.consumer_decompression_limits == {tag: 4096}
+
+        consumer.cancel()
+        assert channel.consumer_decompression_limits == {}
+
+    def test_max_decompression_size__removed_by_queue_cancel(self):
+        channel = self.connection.channel()
+        queue = Queue('qname', self.exchange, 'rkey')
+        consumer = Consumer(channel, queue,
+                            max_decompression_size=4096, auto_declare=False)
+        consumer.consume()
+        tag = consumer._active_tags[queue.name]
+        consumer.cancel_by_queue(queue)
+        assert tag not in channel.consumer_decompression_limits
+
+    def test_max_decompression_size__per_consumer_on_shared_connection(self):
+        conn = Connection('memory://')
+        q1 = Queue('q.limit1', self.exchange, 'k1')
+        q2 = Queue('q.limit2', self.exchange, 'k2')
+        c1 = conn.Consumer(q1, max_decompression_size=1024, auto_declare=False)
+        c2 = conn.Consumer(q2, max_decompression_size=8192, auto_declare=False)
+        c1.consume()
+        c2.consume()
+        tag1 = c1._active_tags[q1.name]
+        tag2 = c2._active_tags[q2.name]
+        # the two consumers share a channel but keep separate limits
+        assert tag1 != tag2
+        assert c1.channel is c2.channel
+        assert c1.channel.consumer_decompression_limits == {
+            tag1: 1024, tag2: 8192}
+        c1.cancel()
+        assert tag2 in c2.channel.consumer_decompression_limits
+        c2.cancel()
+        assert c2.channel.consumer_decompression_limits == {}
+
+    def test_max_decompression_size__oversized_message_decode_error(self):
+        conn = Connection('memory://')
+        q = Queue('q.limited', self.exchange, 'limited')
+        producer = conn.Producer()
+        producer.publish(b'x' * 100000, routing_key='limited',
+                         declare=[q], exchange=self.exchange,
+                         compression='zlib', serializer=None,
+                         content_type='application/data',
+                         content_encoding='binary')
+
+        delivered = []
+        decode_errors = []
+
+        def on_decode_error(message, exc):
+            decode_errors.append((message, exc))
+            message.reject()
+
+        with conn.Consumer(q, callbacks=[lambda body, m: delivered.append(body)],
+                           on_decode_error=on_decode_error,
+                           max_decompression_size=1024,
+                           auto_declare=False) as consumer:
+            conn.drain_events(timeout=1)
+
+        assert not delivered
+        assert len(decode_errors) == 1
+        message, exc = decode_errors[0]
+        assert isinstance(exc, LimitExceeded)
+        # original compressed content is retained on the failed message
+        assert message.headers['compression']
+        assert len(message.body) < 100000
+
+    def test_max_decompression_size__message_within_limit_delivered(self):
+        conn = Connection('memory://')
+        q = Queue('q.ok', self.exchange, 'ok')
+        producer = conn.Producer()
+        producer.publish(b'x' * 100, routing_key='ok', declare=[q],
+                         exchange=self.exchange,
+                         compression='zlib', serializer=None,
+                         content_type='application/data',
+                         content_encoding='binary')
+
+        delivered = []
+        with conn.Consumer(q, callbacks=[lambda body, m: delivered.append(body)],
+                           max_decompression_size=1024,
+                           auto_declare=False):
+            conn.drain_events(timeout=1)
+        assert delivered == [b'x' * 100]
+
+    def test_max_decompression_size__requeue_preserves_compressed_body(self):
+        conn = Connection('memory://')
+        q = Queue('q.requeue', self.exchange, 'requeue')
+        producer = conn.Producer()
+        compressed, ctype = compress(b'x' * 100000, 'zlib')
+        producer.publish(b'x' * 100000, routing_key='requeue',
+                         declare=[q], exchange=self.exchange,
+                         compression='zlib', serializer=None,
+                         content_type='application/data',
+                         content_encoding='binary')
+
+        def on_decode_error(message, exc):
+            message.reject(requeue=True)
+
+        inspect_channel = conn.channel()
+        consumer = conn.Consumer(q, callbacks=[lambda *a: None],
+                                 on_decode_error=on_decode_error,
+                                 max_decompression_size=1024,
+                                 auto_declare=False)
+        consumer.consume()
+        conn.drain_events(timeout=1)
+
+        stored = inspect_channel._get(q.name)
+        body = inspect_channel.decode_body(
+            stored['body'], stored['properties'].get('body_encoding'))
+        assert body == compressed
+        assert stored['headers']['compression'] == ctype
