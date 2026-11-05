@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import enum
+import socket
+import threading
+import weakref
+from functools import wraps
 from itertools import count
 from threading import local
+from time import monotonic
 from typing import TYPE_CHECKING
 
 from .common import maybe_declare
@@ -17,7 +23,10 @@ from .utils.functional import ChannelPromise, maybe_list
 if TYPE_CHECKING:
     from types import TracebackType
 
-__all__ = ('Exchange', 'Queue', 'Producer', 'Consumer')
+__all__ = (
+    'Exchange', 'Queue', 'Producer', 'Consumer',
+    'ConsumerShutdown', 'ConsumerShutdownResult',
+)
 
 DEFAULT_BATCH_SIZE = 1000
 
@@ -472,6 +481,126 @@ class Producer:
             pass
 
 
+class ConsumerShutdownResult(enum.Enum):
+    """Outcome of a graceful :class:`ConsumerShutdown`.
+
+    - ``COMPLETED``: every already-delivered message was acknowledged,
+      rejected or requeued before the timeout elapsed.
+    - ``TIMED_OUT``: the timeout elapsed with messages still unresolved.
+    - ``CONNECTION_LOST``: the broker connection (or a channel on it)
+      failed while stopping or waiting.
+    """
+
+    COMPLETED = 'completed'
+    TIMED_OUT = 'timed_out'
+    CONNECTION_LOST = 'connection_lost'
+
+
+class _ChannelDeliveryState:
+    """Tracks delivered-but-unresolved messages on one channel.
+
+    AMQP delivery tags are scoped to the channel, and ``basic.ack`` /
+    ``basic.nack`` with ``multiple=True`` resolve every outstanding tag up
+    to and including the given tag.  To observe these terminal calls the
+    state installs transparent wrappers around the channel's
+    ``basic_ack``/``basic_reject``/``basic_nack`` methods exactly once and
+    is shared by every consumer bound to that channel, so out-of-order
+    acknowledgements and batch (``multiple``) acknowledgements both resolve
+    exactly the messages that the broker considers settled.
+
+    The wrappers are restored when all tracked consumers detach, which
+    leaves no trace on channels that keep being used afterwards.
+    """
+
+    _ATTR = '_kombu_delivery_state'
+
+    def __init__(self, channel):
+        self.channel = channel
+        self._consumers = weakref.WeakSet()
+        # method name -> (original method, whether it was an instance attr)
+        self._originals = {}
+        try:
+            self._wrap('basic_ack', multiple=True)
+            self._wrap('basic_nack', multiple=True, optional=True)
+            self._wrap('basic_reject', multiple=False, optional=True)
+        except BaseException:
+            self._restore()
+            raise
+
+    @classmethod
+    def attach(cls, consumer, channel):
+        """Return the shared state for ``channel``, registering consumer.
+
+        Returns :const:`None` for channels that cannot have their methods
+        wrapped, in which case delivery tracking is unavailable.
+        """
+        existing = getattr(channel, cls._ATTR, None)
+        if isinstance(existing, cls):
+            existing._consumers.add(consumer)
+            return existing
+        try:
+            state = cls(channel)
+            setattr(channel, cls._ATTR, state)
+        except (AttributeError, TypeError):
+            return None
+        state._consumers.add(consumer)
+        return state
+
+    def detach(self, consumer):
+        """Stop notifying ``consumer`` and unwrap once nobody is left."""
+        self._consumers.discard(consumer)
+        if not self._consumers:
+            self._restore()
+
+    def resolve(self, delivery_tag, multiple=False):
+        if delivery_tag is None:
+            return
+        for consumer in list(self._consumers):
+            consumer._resolve_delivery(delivery_tag, multiple)
+
+    def _wrap(self, name, *, multiple, optional=False):
+        original = getattr(self.channel, name, None)
+        if original is None:
+            if optional:
+                return
+            raise AttributeError(name)
+        was_instance_attr = name in getattr(self.channel, '__dict__', {})
+        state = self
+
+        @wraps(original)
+        def terminal(delivery_tag=None, *args, **kwargs):
+            is_multiple = bool(kwargs.get('multiple', False))
+            if multiple and not is_multiple and args:
+                # e.g. basic_ack(tag, True)
+                is_multiple = bool(args[0])
+            result = original(delivery_tag, *args, **kwargs)
+            state.resolve(delivery_tag, is_multiple)
+            return result
+
+        setattr(self.channel, name, terminal)
+        self._originals[name] = (original, was_instance_attr)
+
+    def _restore(self):
+        channel = self.channel
+        for name, (original, was_instance_attr) in self._originals.items():
+            try:
+                if was_instance_attr:
+                    setattr(channel, name, original)
+                else:
+                    delattr(channel, name)
+            except AttributeError:
+                try:
+                    setattr(channel, name, original)
+                except AttributeError:
+                    pass
+        self._originals.clear()
+        try:
+            if getattr(channel, self._ATTR, None) is self:
+                delattr(channel, self._ATTR)
+        except AttributeError:
+            pass
+
+
 class Consumer:
     """Message consumer.
 
@@ -572,6 +701,10 @@ class Consumer:
         self.tag_prefix = tag_prefix
         self._active_tags = {}
         self._active_queue_no_ack = {}
+        # delivery tags handed to the application but not yet acknowledged,
+        # rejected or requeued (populated lazily on the first delivery).
+        self._outstanding_tags = set()
+        self._delivery_state = None
         if auto_declare is not None:
             self.auto_declare = auto_declare
         if on_decode_error is not None:
@@ -595,6 +728,9 @@ class Consumer:
         previous_no_ack = self._active_queue_no_ack.copy()
         self._active_tags.clear()
         self._active_queue_no_ack.clear()
+        # delivery tags are scoped to the old channel and die with it
+        self._detach_delivery_state()
+        self._outstanding_tags.clear()
         channel = self.channel = maybe_channel(channel)
         # modify dict size while iterating over it is not allowed
         for qname, queue in list(self._queues.items()):
@@ -872,7 +1008,81 @@ class Consumer:
                 raise
             self.on_decode_error(message, exc)
         else:
+            # registered before dispatch, so a synchronous ack/reject from
+            # inside the callback is observed by graceful shutdown.
+            self._track_delivery(message)
             return on_m(message) if on_m else self.receive(decoded, message)
+
+    def _track_delivery(self, message):
+        """Record a delivered message awaiting a terminal ack/reject."""
+        # the broker settles no_ack deliveries itself, nothing to wait for
+        no_ack_consumers = getattr(self.channel, 'no_ack_consumers', None)
+        if no_ack_consumers is not None:
+            try:
+                consumer_tag = message.delivery_info.get('consumer_tag')
+                if consumer_tag in no_ack_consumers:
+                    return
+            except (AttributeError, TypeError):
+                pass
+        delivery_tag = message.delivery_tag
+        if delivery_tag is None:
+            return
+        if self._delivery_state is None:
+            state = _ChannelDeliveryState.attach(self, self.channel)
+            if state is None:
+                # channel cannot be observed; do not pretend we can tell
+                # when its deliveries settle.
+                return
+            self._delivery_state = state
+        self._outstanding_tags.add(delivery_tag)
+
+    def _resolve_delivery(self, delivery_tag, multiple=False):
+        """Mark a delivery tag settled by ack/reject/nack.
+
+        With ``multiple`` the broker settled every outstanding tag up to
+        and including ``delivery_tag``; otherwise only that single tag.
+        """
+        tags = self._outstanding_tags
+        if not tags:
+            return
+        if multiple:
+            tags.difference_update(
+                {tag for tag in tags if tag <= delivery_tag}
+            )
+        else:
+            tags.discard(delivery_tag)
+
+    def _detach_delivery_state(self):
+        state = self._delivery_state
+        if state is not None:
+            self._delivery_state = None
+            state.detach(self)
+
+    @property
+    def outstanding_message_count(self):
+        """Number of delivered messages not yet acked, rejected/requeued."""
+        return len(self._outstanding_tags)
+
+    def shutdown(self, timeout=None, cancel=True, poll_interval=1.0):
+        """Gracefully stop this consumer and wait for in-flight messages.
+
+        Convenience wrapper around :class:`ConsumerShutdown` for a single
+        consumer.
+
+        Arguments:
+        ---------
+            timeout (float): Maximum seconds to wait for already-delivered
+                messages to be acknowledged or returned. :const:`None`
+                waits indefinitely.
+            cancel (bool): Stop new deliveries (``basic.cancel``) before
+                waiting. Enabled by default.
+            poll_interval (float): Seconds per ``drain_events`` tick while
+                waiting; keeps broker heartbeats flowing.
+        """
+        return ConsumerShutdown(
+            [self], timeout=timeout, cancel=cancel,
+            poll_interval=poll_interval,
+        ).stop()
 
     def __repr__(self):
         return f'<{type(self).__name__}: {self.queues}>'
@@ -883,3 +1093,173 @@ class Consumer:
             return self.channel.connection.client
         except AttributeError:
             pass
+
+
+class ConsumerShutdown:
+    """Gracefully stop consumers that share one broker connection.
+
+    Coordinates several :class:`Consumer` instances, including consumers
+    bound to different channels of the same connection, while they exit:
+
+    1. each consumer is optionally canceled first, so no new messages are
+       delivered (``cancel=True``, the default);
+    2. the shared connection is drained until every message already
+       delivered to any of the consumers has been acknowledged, rejected or
+       requeued -- out-of-order acks and batch (``multiple=True``) acks are
+       both understood -- or until ``timeout`` elapses;
+    3. broker heartbeats are checked on every tick while waiting;
+    4. clean completion, timeout and connection loss are reported as
+       distinct :class:`ConsumerShutdownResult` values.
+
+    The result is memoized, so :meth:`stop` may be called repeatedly; the
+    tracking hooks installed on the channels are released exactly once.
+    The object can also be used as a context manager, in which case
+    :meth:`stop` runs on exit::
+
+        with ConsumerShutdown([consumer1, consumer2], timeout=10) as stop:
+            ...  # workers keep processing, heartbeats flow on exit
+        assert stop.result is ConsumerShutdownResult.COMPLETED
+
+    Arguments:
+    ---------
+        consumers (Sequence[Consumer]): Consumers to stop. They must all
+            share the same broker :class:`~kombu.Connection`.
+        timeout (float): Maximum seconds to wait for delivered messages to
+            settle. :const:`None` (default) waits indefinitely.
+        cancel (bool): Cancel the consumers (stop new deliveries) before
+            waiting. Enabled by default.
+        poll_interval (float): Seconds per ``drain_events`` tick while
+            waiting. The broker connection is drained and heartbeats are
+            checked at least this often. Default is 1 second.
+        heartbeat_rate (int): Rate passed to
+            :meth:`~kombu.Connection.heartbeat_check`.
+    """
+
+    def __init__(self, consumers, timeout=None, *, cancel=True,
+                 poll_interval=1.0, heartbeat_rate=2):
+        consumers = list(maybe_list(consumers))
+        if not consumers:
+            raise ValueError(
+                'ConsumerShutdown requires at least one consumer')
+        if timeout is not None and (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float)) or timeout < 0):
+            raise ValueError('timeout must be a non-negative number or None')
+        if isinstance(poll_interval, bool) or not isinstance(
+                poll_interval, (int, float)) or poll_interval <= 0:
+            raise ValueError('poll_interval must be a positive number')
+        self.consumers = consumers
+        self.timeout = timeout
+        self.cancel_on_stop = cancel
+        self.poll_interval = float(poll_interval)
+        self.heartbeat_rate = heartbeat_rate
+        self.result = None
+        self._released = False
+        self._lock = threading.Lock()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+
+    def stop(self):
+        """Cancel the consumers and wait for their deliveries to settle.
+
+        Repeated calls return the first :class:`ConsumerShutdownResult`
+        without canceling or waiting again.
+        """
+        with self._lock:
+            if self.result is None:
+                self.result = self._run()
+                self._release()
+            return self.result
+
+    def close(self):
+        """Release channel tracking hooks without waiting.
+
+        Safe to call more than once and after :meth:`stop`; consumers keep
+        working and tracking is reinstalled lazily on the next delivery.
+        """
+        with self._lock:
+            self._release()
+
+    def _run(self):
+        # nothing active to cancel and nothing outstanding to wait for:
+        # this also covers consumers that never got a concrete channel
+        # (a still-unresolved channel promise), so no connection is needed.
+        if all(not consumer._active_tags and not consumer._outstanding_tags
+               for consumer in self.consumers):
+            return ConsumerShutdownResult.COMPLETED
+        connection = self._shared_connection()
+        if connection is None:
+            return ConsumerShutdownResult.CONNECTION_LOST
+        if self.cancel_on_stop and not self._cancel_consumers(connection):
+            return ConsumerShutdownResult.CONNECTION_LOST
+        return self._wait_until_settled(connection)
+
+    def _shared_connection(self):
+        connection = None
+        for consumer in self.consumers:
+            candidate = consumer.connection
+            if candidate is None:
+                return None
+            if connection is None:
+                connection = candidate
+            elif candidate is not connection:
+                raise ValueError(
+                    'ConsumerShutdown only coordinates consumers that share '
+                    'the same broker connection')
+        return connection
+
+    def _cancel_consumers(self, connection):
+        conn_errors = self._connection_errors(connection)
+        for consumer in self.consumers:
+            try:
+                consumer.cancel()
+            except conn_errors:
+                return False
+        return True
+
+    @staticmethod
+    def _connection_errors(connection):
+        # OSError covers socket failures even for transports that only
+        # advertise their own exception classes.
+        return tuple(connection.connection_errors or ()) + (OSError,)
+
+    def _has_outstanding_messages(self):
+        return any(consumer._outstanding_tags for consumer in self.consumers)
+
+    def _wait_until_settled(self, connection):
+        deadline = None
+        if self.timeout is not None:
+            deadline = monotonic() + self.timeout
+        # an idle drain timeout is normal and must not be confused with a
+        # dropped connection.
+        timeout_errors = (socket.timeout, TimeoutError)
+        conn_errors = self._connection_errors(connection)
+        while self._has_outstanding_messages():
+            wait = self.poll_interval
+            if deadline is not None:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return ConsumerShutdownResult.TIMED_OUT
+                wait = min(wait, remaining)
+            try:
+                connection.drain_events(timeout=wait)
+            except timeout_errors:
+                pass
+            except conn_errors:
+                return ConsumerShutdownResult.CONNECTION_LOST
+            try:
+                connection.heartbeat_check(rate=self.heartbeat_rate)
+            except conn_errors:
+                return ConsumerShutdownResult.CONNECTION_LOST
+        return ConsumerShutdownResult.COMPLETED
+
+    def _release(self):
+        if self._released:
+            return
+        self._released = True
+        for consumer in self.consumers:
+            consumer._detach_delivery_state()

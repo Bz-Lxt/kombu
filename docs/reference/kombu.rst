@@ -183,6 +183,7 @@
         .. autoattribute:: on_message
         .. autoattribute:: on_decode_error
         .. autoattribute:: connection
+        .. autoattribute:: outstanding_message_count
 
         .. automethod:: declare
         .. automethod:: register_callback
@@ -197,3 +198,14 @@
         .. automethod:: recover
         .. automethod:: receive
         .. automethod:: revive
+        .. automethod:: shutdown
+
+    Graceful Consumer Shutdown
+    --------------------------
+
+    .. autoclass:: ConsumerShutdown
+        :members: stop, close, result, __enter__, __exit__
+
+    .. autoclass:: ConsumerShutdownResult
+        :members:
+        :undoc-members:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pickle
+import socket
 import sys
 import threading
 from collections import defaultdict
@@ -8,8 +9,12 @@ from unittest.mock import ANY, Mock, patch
 
 import pytest
 
-from kombu import Connection, Consumer, Exchange, Producer, Queue
+from kombu import (
+    Connection, Consumer, ConsumerShutdown, ConsumerShutdownResult,
+    Exchange, Producer, Queue,
+)
 from kombu.exceptions import MessageStateError, OperationalError
+from kombu.message import Message
 from kombu.utils import json
 from kombu.utils.functional import ChannelPromise
 from t.mocks import Transport
@@ -1170,3 +1175,417 @@ class test_Consumer:
         p = self.connection.Consumer()
         p.channel = object()
         assert p.connection is None
+
+
+class test_ConsumerShutdown:
+
+    def setup_method(self):
+        self.connection = Connection(transport=Transport)
+        self.connection.connect()
+        assert self.connection.connection.connected
+
+    def _consumer(self, channel=None, name='q', no_ack=False, on_message=None):
+        channel = channel if channel is not None else self.connection.channel()
+        # the mock transport's message_to_python turns raw payloads into
+        # messages; these tests feed finished Message instances directly.
+        channel.message_to_python = None
+        return Consumer(
+            channel, [Queue(name)], auto_declare=False, no_ack=no_ack,
+            on_message=on_message or Mock(name='on_message'),
+        )
+
+    def _deliver(self, consumer, tag, consumer_tag='ctag'):
+        message = Message(
+            body=b'{}', channel=consumer.channel, delivery_tag=tag,
+            content_type='application/json', content_encoding='utf-8',
+            delivery_info={'consumer_tag': consumer_tag},
+        )
+        consumer._receive_callback(message)
+        return message
+
+    def _idle_connection(self):
+        self.connection.drain_events = Mock(side_effect=socket.timeout)
+        self.connection.heartbeat_check = Mock()
+
+    # -- accurate completion detection ---------------------------------
+
+    def test_out_of_order_acks_are_tracked(self):
+        consumer = self._consumer()
+        first = self._deliver(consumer, 1)
+        second = self._deliver(consumer, 2)
+        third = self._deliver(consumer, 3)
+        assert consumer.outstanding_message_count == 3
+
+        second.ack()
+        third.ack()
+        first.ack()
+        assert consumer.outstanding_message_count == 0
+
+    def test_batch_multiple_ack_resolves_all_earlier_tags(self):
+        channel = self.connection.channel()
+        channel.message_to_python = None
+        consumer = Consumer(channel, on_message=Mock())
+        for tag in range(1, 6):
+            self._deliver(consumer, tag)
+
+        channel.basic_ack(5, multiple=True)
+        assert consumer.outstanding_message_count == 0
+
+    def test_batch_ack_only_resolves_tags_up_to_delivery_tag(self):
+        channel = self.connection.channel()
+        channel.message_to_python = None
+        consumer = Consumer(channel, on_message=Mock())
+        for tag in range(1, 6):
+            self._deliver(consumer, tag)
+
+        channel.basic_ack(3, multiple=True)
+        assert consumer._outstanding_tags == {4, 5}
+
+    def test_reject_requeue_and_nack_settle_deliveries(self):
+        channel = self.connection.channel()
+        channel.message_to_python = None
+        channel.basic_nack = Mock()
+        consumer = Consumer(channel, on_message=Mock())
+        first = self._deliver(consumer, 1)
+        second = self._deliver(consumer, 2)
+        self._deliver(consumer, 3)
+
+        first.reject()
+        second.requeue()
+        channel.basic_nack(3)
+        assert consumer.outstanding_message_count == 0
+
+    def test_batch_nack_multiple_is_understood(self):
+        channel = self.connection.channel()
+        channel.message_to_python = None
+        channel.basic_nack = Mock()
+        consumer = Consumer(channel, on_message=Mock())
+        for tag in range(1, 4):
+            self._deliver(consumer, tag)
+
+        channel.basic_nack(3, multiple=True)
+        assert consumer.outstanding_message_count == 0
+
+    def test_no_ack_deliveries_are_not_waited_for(self):
+        channel = self.connection.channel()
+        channel.message_to_python = None
+        channel.no_ack_consumers = {'ctag'}
+        consumer = self._consumer(channel=channel, no_ack=True)
+        self._deliver(consumer, 1)
+        assert consumer.outstanding_message_count == 0
+
+    def test_synchronous_ack_in_callback_completes_without_draining(self):
+        channel = self.connection.channel()
+        channel.message_to_python = None
+
+        def on_message(message):
+            message.ack()
+
+        consumer = Consumer(channel, on_message=on_message)
+        self._deliver(consumer, 1)
+        self.connection.drain_events = Mock()
+        self.connection.heartbeat_check = Mock()
+
+        result = ConsumerShutdown([consumer]).stop()
+        assert result is ConsumerShutdownResult.COMPLETED
+        self.connection.drain_events.assert_not_called()
+
+    def test_message_delivered_after_cancel_is_still_waited_for(self):
+        channel = self.connection.channel()
+        channel.message_to_python = None
+        consumer = Consumer(channel, [Queue('q')], auto_declare=False,
+                            on_message=Mock())
+        consumer.consume()
+        first = self._deliver(consumer, 1)
+
+        late = []
+
+        def drain_events(**kwargs):
+            # broker races one more delivery in after basic.cancel
+            if not late:
+                late.append(True)
+                second = self._deliver(consumer, 2)
+                first.ack()
+                second.ack()
+            raise socket.timeout
+
+        self.connection.drain_events = Mock(side_effect=drain_events)
+        self.connection.heartbeat_check = Mock()
+
+        result = ConsumerShutdown([consumer], timeout=1,
+                                  poll_interval=0.01).stop()
+        assert result is ConsumerShutdownResult.COMPLETED
+
+    # -- shared connection, separate channels ---------------------------
+
+    def test_consumers_on_different_channels_share_one_wait(self):
+        channel1 = self.connection.channel()
+        channel2 = self.connection.channel()
+        channel1.message_to_python = channel2.message_to_python = None
+        first = Consumer(channel1, [Queue('q1')], auto_declare=False,
+                         on_message=Mock())
+        second = Consumer(channel2, [Queue('q2')], auto_declare=False,
+                          on_message=Mock())
+        first.consume()
+        second.consume()
+        message1 = self._deliver(first, 1)
+        message2 = self._deliver(second, 10)
+
+        ticks = []
+
+        def drain_events(**kwargs):
+            ticks.append(kwargs['timeout'])
+            if len(ticks) == 1:
+                message1.ack()
+            elif len(ticks) == 2:
+                message2.ack()
+            raise socket.timeout
+
+        self.connection.drain_events = Mock(side_effect=drain_events)
+        self.connection.heartbeat_check = Mock()
+
+        result = ConsumerShutdown([first, second], timeout=1,
+                                  poll_interval=0.01).stop()
+        assert result is ConsumerShutdownResult.COMPLETED
+        assert 'basic_cancel' in channel1
+        assert 'basic_cancel' in channel2
+        assert not first._active_tags
+        assert not second._active_tags
+
+    def test_one_unsettled_consumer_means_timeout(self):
+        channel1 = self.connection.channel()
+        channel2 = self.connection.channel()
+        channel1.message_to_python = channel2.message_to_python = None
+        first = self._consumer(channel1, 'q1')
+        second = self._consumer(channel2, 'q2')
+        self._deliver(first, 1).ack()
+        self._deliver(second, 10)
+        self._idle_connection()
+
+        result = ConsumerShutdown([first, second], timeout=0.02,
+                                  poll_interval=0.01).stop()
+        assert result is ConsumerShutdownResult.TIMED_OUT
+
+    def test_consumers_on_different_connections_are_rejected(self):
+        other = Connection(transport=Transport)
+        other.connect()
+        first = self._consumer(self.connection.channel(), 'q1')
+        second = self._consumer(other.channel(), 'q2')
+        self._deliver(first, 1)
+        self._deliver(second, 2)
+        with pytest.raises(ValueError):
+            ConsumerShutdown([first, second]).stop()
+
+    def test_consumers_sharing_a_channel_share_one_tracker(self):
+        channel = self.connection.channel()
+        channel.message_to_python = None
+        first = Consumer(channel, [Queue('q1')], auto_declare=False,
+                         on_message=Mock())
+        second = Consumer(channel, [Queue('q2')], auto_declare=False,
+                          on_message=Mock())
+        self._deliver(first, 1)
+        self._deliver(second, 2)
+
+        state = channel._kombu_delivery_state
+        assert first in state._consumers
+        assert second in state._consumers
+
+        channel.basic_ack(2, multiple=True)
+        assert first.outstanding_message_count == 0
+        assert second.outstanding_message_count == 0
+
+    # -- cancel is optional ---------------------------------------------
+
+    def test_cancel_false_leaves_consumers_active(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, [Queue('q')], auto_declare=False,
+                            on_message=Mock())
+        consumer.consume()
+        ConsumerShutdown([consumer], cancel=False).stop()
+        assert consumer._active_tags
+        assert 'basic_cancel' not in channel
+
+    def test_connection_lost_during_cancel(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, [Queue('q')], auto_declare=False,
+                            on_message=Mock())
+        consumer.consume()
+        channel.basic_cancel = Mock(
+            side_effect=self.connection.connection_errors[0]())
+
+        result = ConsumerShutdown([consumer]).stop()
+        assert result is ConsumerShutdownResult.CONNECTION_LOST
+
+    # -- heartbeat is maintained while waiting --------------------------
+
+    def test_heartbeat_runs_on_every_wait_tick(self):
+        consumer = self._consumer()
+        self._deliver(consumer, 1)
+        self.connection.drain_events = Mock(side_effect=socket.timeout)
+        self.connection.heartbeat_check = Mock()
+
+        result = ConsumerShutdown(
+            [consumer], timeout=0.02, poll_interval=0.01, heartbeat_rate=3,
+        ).stop()
+
+        assert result is ConsumerShutdownResult.TIMED_OUT
+        self.connection.heartbeat_check.assert_called_with(rate=3)
+        assert self.connection.heartbeat_check.call_count >= 1
+        for call in self.connection.drain_events.call_args_list:
+            assert call.kwargs['timeout'] <= 0.01
+
+    # -- distinct outcomes ----------------------------------------------
+
+    def test_timeout_result(self):
+        consumer = self._consumer()
+        self._deliver(consumer, 1)
+        self._idle_connection()
+        result = ConsumerShutdown([consumer], timeout=0.01,
+                                  poll_interval=0.005).stop()
+        assert result is ConsumerShutdownResult.TIMED_OUT
+
+    def test_connection_lost_when_drain_fails(self):
+        consumer = self._consumer()
+        self._deliver(consumer, 1)
+        self.connection.drain_events = Mock(
+            side_effect=self.connection.connection_errors[0]())
+        self.connection.heartbeat_check = Mock()
+
+        result = ConsumerShutdown([consumer]).stop()
+        assert result is ConsumerShutdownResult.CONNECTION_LOST
+
+    def test_connection_lost_when_heartbeat_fails(self):
+        consumer = self._consumer()
+        self._deliver(consumer, 1)
+        self.connection.drain_events = Mock(side_effect=socket.timeout)
+        self.connection.heartbeat_check = Mock(side_effect=OSError('reset'))
+
+        result = ConsumerShutdown([consumer], timeout=1,
+                                  poll_interval=0.01).stop()
+        assert result is ConsumerShutdownResult.CONNECTION_LOST
+
+    def test_outcomes_are_distinct(self):
+        assert len({
+            ConsumerShutdownResult.COMPLETED,
+            ConsumerShutdownResult.TIMED_OUT,
+            ConsumerShutdownResult.CONNECTION_LOST,
+        }) == 3
+
+    def test_consumer_without_channel_completes_when_idle(self):
+        consumer = Consumer(None, on_message=Mock())
+        assert consumer.connection is None
+        result = ConsumerShutdown([consumer]).stop()
+        assert result is ConsumerShutdownResult.COMPLETED
+
+    def test_unresolved_channel_promise_completes_when_idle(self):
+        promise = ChannelPromise(lambda: self.connection.default_channel)
+        consumer = Consumer(promise, [Queue('q')], auto_declare=False,
+                            on_message=Mock())
+        assert isinstance(consumer.channel, ChannelPromise)
+        result = ConsumerShutdown([consumer]).stop()
+        assert result is ConsumerShutdownResult.COMPLETED
+
+    # -- idempotency and resource release -------------------------------
+
+    def test_stop_is_idempotent(self):
+        channel = self.connection.channel()
+        consumer = Consumer(channel, [Queue('q')], auto_declare=False,
+                            on_message=Mock())
+        consumer.consume()
+        shutdown = ConsumerShutdown([consumer])
+        assert shutdown.stop() is ConsumerShutdownResult.COMPLETED
+        cancels = channel.called.count('basic_cancel')
+        assert shutdown.stop() is ConsumerShutdownResult.COMPLETED
+        assert channel.called.count('basic_cancel') == cancels
+
+    def test_stop_restores_channel_methods_and_marker(self):
+        channel = self.connection.channel()
+        channel.message_to_python = None
+        consumer = Consumer(channel, on_message=Mock())
+        self._deliver(consumer, 1)
+        assert 'basic_ack' in vars(channel)
+
+        self._idle_connection()
+        ConsumerShutdown([consumer], timeout=0.01,
+                         poll_interval=0.005).stop()
+
+        assert 'basic_ack' not in vars(channel)
+        assert 'basic_reject' not in vars(channel)
+        assert '_kombu_delivery_state' not in vars(channel)
+        # the original channel method keeps working
+        channel.basic_ack(99)
+        assert 'basic_ack' in channel.called
+
+    def test_close_is_idempotent_and_safe_without_stop(self):
+        consumer = self._consumer()
+        shutdown = ConsumerShutdown([consumer])
+        shutdown.close()
+        shutdown.close()
+
+    def test_tracking_is_reinstalled_after_release(self):
+        channel = self.connection.channel()
+        channel.message_to_python = None
+        consumer = Consumer(channel, on_message=Mock())
+        first = self._deliver(consumer, 1)
+        shutdown = ConsumerShutdown([consumer])
+        shutdown.close()
+        assert '_kombu_delivery_state' not in vars(channel)
+
+        # a later delivery transparently re-attaches; both the surviving
+        # in-flight message and the new one are resolved through the new
+        # wrapper.
+        second = self._deliver(consumer, 2)
+        settled = []
+
+        def drain_events(**kwargs):
+            if not settled:
+                settled.append(True)
+                first.ack()
+                second.ack()
+            raise socket.timeout
+
+        self.connection.drain_events = Mock(side_effect=drain_events)
+        self.connection.heartbeat_check = Mock()
+        assert shutdown.stop() is ConsumerShutdownResult.COMPLETED
+
+    def test_revive_detaches_old_channel_and_forgets_tags(self):
+        channel1 = self.connection.channel()
+        channel2 = self.connection.channel()
+        channel1.message_to_python = channel2.message_to_python = None
+        consumer = Consumer(channel1, on_message=Mock())
+        self._deliver(consumer, 1)
+        assert channel1._kombu_delivery_state is not None
+
+        consumer.revive(channel2)
+        assert '_kombu_delivery_state' not in vars(channel1)
+        assert consumer.outstanding_message_count == 0
+
+        self._deliver(consumer, 7)
+        assert channel2._kombu_delivery_state is not None
+
+    # -- ergonomics ------------------------------------------------------
+
+    def test_context_manager_stops_on_exit(self):
+        consumer = self._consumer()
+        with ConsumerShutdown([consumer]) as shutdown:
+            pass
+        assert shutdown.result is ConsumerShutdownResult.COMPLETED
+
+    def test_consumer_shutdown_convenience_method(self):
+        consumer = self._consumer()
+        assert consumer.shutdown() is ConsumerShutdownResult.COMPLETED
+
+    def test_invalid_arguments(self):
+        consumer = self._consumer()
+        with pytest.raises(ValueError):
+            ConsumerShutdown([])
+        with pytest.raises(ValueError):
+            ConsumerShutdown([consumer], timeout=-1)
+        with pytest.raises(ValueError):
+            ConsumerShutdown([consumer], timeout='soon')
+        with pytest.raises(ValueError):
+            ConsumerShutdown([consumer], timeout=True)
+        with pytest.raises(ValueError):
+            ConsumerShutdown([consumer], poll_interval=0)
+        with pytest.raises(ValueError):
+            ConsumerShutdown([consumer], poll_interval=False)
