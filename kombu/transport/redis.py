@@ -102,8 +102,8 @@ from time import time
 from packaging.version import Version
 from vine import promise
 
-from kombu.exceptions import (BatchPublishError, InconsistencyError,
-                              VersionMismatch)
+from kombu.exceptions import (BatchPublishError, ChannelError,
+                              InconsistencyError, VersionMismatch)
 from kombu.log import get_logger
 from kombu.transport.base import to_rabbitmq_queue_arguments
 from kombu.utils import symbol_by_name
@@ -859,6 +859,14 @@ class Channel(virtual.Channel):
     _closing = False
     supports_fanout = True
     keyprefix_queue = '_kombu.binding.%s'
+    #: Set holding the exchange-to-exchange bindings out of one exchange.
+    keyprefix_exchange_bindings = '_kombu.exchange.binding.%s'
+    #: Reverse index: set holding exchange-to-exchange bindings into one
+    #: exchange (the third member field is the source exchange).
+    keyprefix_exchange_bindings_to = '_kombu.exchange.binding.to.%s'
+    #: Hash storing declared exchange metadata (name -> JSON document),
+    #: so that every connection shares the exchange types and attributes.
+    keyprefix_exchanges = '_kombu.exchanges'
     keyprefix_fanout = '/{db}.'
     sep = '\x06\x16'
     _in_poll = False
@@ -1607,6 +1615,167 @@ class Channel(virtual.Channel):
                 # were deleted. We need just return empty list.
                 return []
             return [tuple(bytes_to_str(val).split(self.sep)) for val in values]
+
+    def _binding_member(self, routing_key, pattern, name):
+        return self.sep.join([routing_key or '', pattern or '', name or ''])
+
+    def _exchange_bind(self, source, routing_key, pattern, destination):
+        """Persist an exchange-to-exchange binding in Redis.
+
+        Both the forward set (out of the source) and the reverse set (into
+        the destination) are maintained, so bindings can be reused by every
+        connection and cleaned up from either side on exchange deletion.
+        """
+        with self.conn_or_acquire() as client:
+            client.sadd(
+                self.keyprefix_exchange_bindings % source,
+                self._binding_member(routing_key, pattern, destination),
+            )
+            client.sadd(
+                self.keyprefix_exchange_bindings_to % destination,
+                self._binding_member(routing_key, pattern, source),
+            )
+
+    def _exchange_unbind(self, source, routing_key, pattern, destination):
+        with self.conn_or_acquire() as client:
+            client.srem(
+                self.keyprefix_exchange_bindings % source,
+                self._binding_member(routing_key, pattern, destination),
+            )
+            client.srem(
+                self.keyprefix_exchange_bindings_to % destination,
+                self._binding_member(routing_key, pattern, source),
+            )
+
+    def get_exchange_binding_table(self, exchange):
+        key = self.keyprefix_exchange_bindings % exchange
+        with self.conn_or_acquire() as client:
+            values = client.smembers(key)
+            if not values:
+                return []
+            return [tuple(bytes_to_str(val).split(self.sep)) for val in values]
+
+    def _delete_exchange_bindings(self, exchange):
+        # Remove bindings this channel's local broker state knows about.
+        super()._delete_exchange_bindings(exchange)
+        # Bindings declared by other connections only exist in Redis; clean
+        # those as well by walking the forward and reverse sets.
+        with self.conn_or_acquire() as client:
+            forward_key = self.keyprefix_exchange_bindings % exchange
+            reverse_key = self.keyprefix_exchange_bindings_to % exchange
+            # Snapshot the members before mutating the sets.
+            for member in tuple(client.smembers(forward_key) or ()):
+                rkey, pattern, destination = (
+                    bytes_to_str(member).split(self.sep))
+                client.srem(forward_key, member)
+                client.srem(
+                    self.keyprefix_exchange_bindings_to % destination,
+                    self._binding_member(rkey, pattern, exchange),
+                )
+            for member in tuple(client.smembers(reverse_key) or ()):
+                rkey, pattern, source = (
+                    bytes_to_str(member).split(self.sep))
+                client.srem(reverse_key, member)
+                client.srem(
+                    self.keyprefix_exchange_bindings % source,
+                    self._binding_member(rkey, pattern, exchange),
+                )
+
+    def _save_exchange_meta(self, exchange, type, durable, auto_delete,
+                            arguments):
+        """Persist exchange declaration metadata in Redis."""
+        meta = dumps({
+            'type': type,
+            'durable': durable,
+            'auto_delete': auto_delete,
+            'arguments': arguments or {},
+        })
+        with self.conn_or_acquire() as client:
+            client.hset(self.keyprefix_exchanges, exchange, meta)
+
+    def _load_exchange_meta(self, exchange):
+        """Load exchange declaration metadata from Redis."""
+        with self.conn_or_acquire() as client:
+            raw = client.hget(self.keyprefix_exchanges, exchange)
+        if not isinstance(raw, (bytes, str)):
+            return None
+        meta = loads(bytes_to_str(raw))
+        meta.setdefault('arguments', {})
+        return meta
+
+    def _hydrate_exchange(self, exchange):
+        """Copy exchange metadata from Redis into the local broker state."""
+        meta = self._load_exchange_meta(exchange)
+        if meta is None:
+            return False
+        self.state.exchanges[exchange] = {
+            'type': meta['type'],
+            'durable': meta.get('durable', False),
+            'auto_delete': meta.get('auto_delete', False),
+            'arguments': meta.get('arguments') or {},
+            'table': [],
+        }
+        return True
+
+    def _require_exchange(self, exchange):
+        if exchange not in self.state.exchanges:
+            if not self._hydrate_exchange(exchange):
+                raise ChannelError(
+                    f'NOT_FOUND - no exchange {exchange!r} in vhost '
+                    f"{self.connection.client.virtual_host or '/'!r}",
+                    (50, 10), 'Channel.exchange_bind', '404',
+                )
+
+    def typeof(self, exchange, default='direct'):
+        # Resolve exchanges declared by other connections from Redis.
+        if exchange not in self.state.exchanges:
+            self._hydrate_exchange(exchange)
+        return super().typeof(exchange, default)
+
+    def exchange_declare(self, exchange=None, type='direct', durable=False,
+                         auto_delete=False, arguments=None, nowait=False,
+                         passive=False):
+        type = type or 'direct'
+        exchange = exchange or 'amq.%s' % type
+        if passive:
+            if (exchange not in self.state.exchanges and
+                    self._load_exchange_meta(exchange) is None):
+                raise ChannelError(
+                    f'NOT_FOUND - no exchange {exchange!r} in vhost '
+                    f"{self.connection.client.virtual_host or '/'!r}",
+                    (50, 10), 'Channel.exchange_declare', '404',
+                )
+            return
+        # Check equivalence against the topology stored in Redis, so that
+        # redeclaring an exchange through another connection keeps the same
+        # routing semantics.
+        remote = self._load_exchange_meta(exchange)
+        if remote is not None:
+            prev_exchange_type = self.exchange_types[remote['type']]
+            if not prev_exchange_type.equivalent(
+                    remote, exchange, type, durable, auto_delete, arguments):
+                raise virtual.NotEquivalentError(
+                    "Cannot redeclare exchange %r: "
+                    "%r" % (exchange, (
+                        remote.get('type'), type,
+                        remote.get('durable'), durable,
+                        remote.get('auto_delete'), auto_delete,
+                        remote.get('arguments'), arguments)),
+                )
+        super().exchange_declare(
+            exchange=exchange, type=type, durable=durable,
+            auto_delete=auto_delete, arguments=arguments, nowait=nowait,
+        )
+        self._save_exchange_meta(
+            exchange, type, durable, auto_delete, arguments,
+        )
+
+    def exchange_delete(self, exchange, if_unused=False, nowait=False):
+        super().exchange_delete(
+            exchange, if_unused=if_unused, nowait=nowait,
+        )
+        with self.conn_or_acquire() as client:
+            client.hdel(self.keyprefix_exchanges, exchange)
 
     def _purge(self, queue):
         with self.conn_or_acquire() as client:

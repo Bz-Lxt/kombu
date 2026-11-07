@@ -17,7 +17,8 @@ from unittest.mock import ANY, MagicMock, Mock, call, patch
 import pytest
 
 from kombu import Connection, Consumer, Exchange, Producer, Queue
-from kombu.exceptions import BatchPublishError, VersionMismatch
+from kombu.exceptions import (BatchPublishError, ChannelError,
+                              VersionMismatch)
 from kombu.transport import virtual
 from kombu.utils import eventio  # patch poll
 from kombu.utils.json import dumps, loads
@@ -137,8 +138,15 @@ class Client:
     def ping(self, *args, **kwargs):
         return True
 
-    def srem(self, key, *args):
-        self.sets.pop(key, None)
+    def srem(self, key, *members):
+        if not members:
+            # legacy test helper behaviour: drop the whole set
+            self.sets.pop(key, None)
+        else:
+            bound = self.sets.get(key)
+            if bound is not None:
+                for member in members:
+                    bound.discard(member)
     zrem = srem
 
     def llen(self, key):
@@ -2216,6 +2224,175 @@ class test_Channel:
             actual_calls = pipeline_mock.method_calls
             for expected_call in expected_calls:
                 assert expected_call in actual_calls
+
+    def _ec_publish(self, connection, exchange, routing_key, body):
+        Producer(connection.default_channel).publish(
+            body, routing_key=routing_key,
+            exchange=Exchange(exchange, durable=False),
+            declare=[])
+
+    def _ec_body(self, channel, queue):
+        return base64.b64decode(channel._get(queue)['body'])
+
+    def test_exchange_bind_persists_binding_sets_and_meta(self):
+        channel = self.channel
+        channel.exchange_declare('ec1.a', 'direct')
+        channel.exchange_declare('ec1.b', 'topic')
+        channel.exchange_bind('ec1.b', 'ec1.a', 'news.us')
+
+        assert Client.sets[
+            channel.keyprefix_exchange_bindings % 'ec1.a'
+        ] == {channel.sep.join(['news.us', '', 'ec1.b'])}
+        assert Client.sets[
+            channel.keyprefix_exchange_bindings_to % 'ec1.b'
+        ] == {channel.sep.join(['news.us', '', 'ec1.a'])}
+        meta = loads(Client.hashes[channel.keyprefix_exchanges]['ec1.a'])
+        assert meta['type'] == 'direct'
+
+    def test_exchange_cascade_reused_on_fresh_connection(self):
+        channel = self.channel
+        channel.exchange_declare('ec2.a', 'direct')
+        channel.exchange_declare('ec2.b', 'topic')
+        channel.queue_declare('ec2.q')
+        channel.queue_bind('ec2.q', 'ec2.b', 'news.#')
+        channel.exchange_bind('ec2.b', 'ec2.a', 'news.us')
+
+        # A completely new connection: nothing in its local broker state.
+        with self.create_connection() as connection:
+            assert not connection.default_channel.state.exchanges
+            self._ec_publish(connection, 'ec2.a', 'news.us', 'cascaded')
+
+        assert self._ec_body(channel, 'ec2.q') == b'cascaded'
+
+    def test_exchange_cascade_cycle_delivers_once(self):
+        channel = self.channel
+        channel.exchange_declare('ec3.a', 'direct')
+        channel.exchange_declare('ec3.b', 'direct')
+        channel.queue_declare('ec3.q')
+        channel.queue_bind('ec3.q', 'ec3.b', 'k')
+        channel.exchange_bind('ec3.b', 'ec3.a', 'k')
+        channel.exchange_bind('ec3.a', 'ec3.b', 'k')  # cycle
+
+        with self.create_connection() as connection:
+            self._ec_publish(connection, 'ec3.a', 'k', 'cycle')
+
+        assert self._ec_body(channel, 'ec3.q') == b'cycle'
+        with pytest.raises(Empty):
+            channel._get('ec3.q')
+
+    def test_exchange_cascade_multiple_paths_deliver_once(self):
+        channel = self.channel
+        for exchange in ('ec4.a', 'ec4.b', 'ec4.c', 'ec4.d'):
+            channel.exchange_declare(exchange, 'direct')
+        channel.queue_declare('ec4.q')
+        channel.queue_bind('ec4.q', 'ec4.d', 'k')
+        channel.exchange_bind('ec4.b', 'ec4.a', 'k')
+        channel.exchange_bind('ec4.c', 'ec4.a', 'k')
+        channel.exchange_bind('ec4.d', 'ec4.b', 'k')
+        channel.exchange_bind('ec4.d', 'ec4.c', 'k')
+
+        with self.create_connection() as connection:
+            self._ec_publish(connection, 'ec4.a', 'k', 'diamond')
+
+        assert self._ec_body(channel, 'ec4.q') == b'diamond'
+        with pytest.raises(Empty):
+            channel._get('ec4.q')
+
+    def test_exchange_unbind_from_other_connection_removes_member(self):
+        channel = self.channel
+        channel.exchange_declare('ec5.a', 'direct')
+        channel.exchange_declare('ec5.b', 'direct')
+        channel.queue_declare('ec5.q')
+        channel.queue_bind('ec5.q', 'ec5.b', 'k')
+        channel.exchange_bind('ec5.b', 'ec5.a', 'k')
+
+        with self.create_connection() as connection:
+            other = connection.default_channel
+            other.exchange_unbind('ec5.b', 'ec5.a', 'k')
+            self._ec_publish(connection, 'ec5.a', 'k', 'unbound')
+
+        assert not Client.sets.get(
+            channel.keyprefix_exchange_bindings % 'ec5.a')
+        with pytest.raises(Empty):
+            channel._get('ec5.q')
+
+    def test_redeclare_topology_after_disconnect_is_consistent(self):
+        channel = self.channel
+        channel.exchange_declare('ec6.a', 'direct')
+        channel.exchange_declare('ec6.b', 'topic')
+        channel.queue_declare('ec6.q')
+        channel.queue_bind('ec6.q', 'ec6.b', 'news.#')
+        channel.exchange_bind('ec6.b', 'ec6.a', 'news.us')
+
+        with self.create_connection() as connection:
+            other = connection.default_channel
+            # Redeclaring identical entities and bindings on a fresh
+            # connection must not error nor duplicate anything.
+            other.exchange_declare('ec6.a', 'direct')
+            other.exchange_declare('ec6.b', 'topic')
+            other.exchange_bind('ec6.b', 'ec6.a', 'news.us')
+            self._ec_publish(connection, 'ec6.a', 'news.us', 'again')
+
+        assert self._ec_body(channel, 'ec6.q') == b'again'
+        with pytest.raises(Empty):
+            channel._get('ec6.q')
+
+    def test_exchange_declare_equivalence_and_passive(self):
+        channel = self.channel
+        channel.exchange_declare('ec7.a', 'direct')
+
+        with self.create_connection() as connection:
+            other = connection.default_channel
+            # Same declaration from another connection is allowed.
+            other.exchange_declare('ec7.a', 'direct')
+            # Passive declare of a remotely declared exchange works.
+            other.exchange_declare('ec7.a', 'direct', passive=True)
+            with pytest.raises(virtual.NotEquivalentError):
+                other.exchange_declare('ec7.a', 'topic')
+            with pytest.raises(ChannelError):
+                other.exchange_declare('ec7.missing', passive=True)
+
+    def test_exchange_bind_unknown_exchange_raises(self):
+        channel = self.channel
+        channel.exchange_declare('ec8.a', 'direct')
+        with pytest.raises(ChannelError):
+            channel.exchange_bind('ec8.missing', 'ec8.a', 'k')
+        with pytest.raises(ChannelError):
+            channel.exchange_bind('ec8.a', 'ec8.missing', 'k')
+
+    def test_exchange_delete_cleans_remote_bindings_and_meta(self):
+        channel = self.channel
+        channel.exchange_declare('ec9.a', 'direct')
+        channel.exchange_declare('ec9.b', 'direct')
+        channel.exchange_declare('ec9.c', 'direct')
+        # a -> b -> c
+        channel.exchange_bind('ec9.b', 'ec9.a', 'k')
+        channel.exchange_bind('ec9.c', 'ec9.b', 'k')
+
+        with self.create_connection() as connection:
+            connection.default_channel.exchange_delete('ec9.b')
+
+        # The exchange metadata and both its forward and reverse binding
+        # sets are gone, and dangling references removed from either side.
+        assert Client.hashes[
+            channel.keyprefix_exchanges].get('ec9.b') is None
+        assert not Client.sets.get(
+            channel.keyprefix_exchange_bindings % 'ec9.b')
+        assert not Client.sets.get(
+            channel.keyprefix_exchange_bindings_to % 'ec9.b')
+        forward_a = Client.sets.get(
+            channel.keyprefix_exchange_bindings % 'ec9.a', set())
+        assert all('ec9.b' not in member for member in forward_a)
+        reverse_c = Client.sets.get(
+            channel.keyprefix_exchange_bindings_to % 'ec9.c', set())
+        assert all('ec9.b' not in member for member in reverse_c)
+
+        with self.create_connection() as connection:
+            self._ec_publish(connection, 'ec9.a', 'k', 'deleted')
+        channel.queue_declare('ec9.qc')
+        channel.queue_bind('ec9.qc', 'ec9.c', 'k')
+        with pytest.raises(Empty):
+            channel._get('ec9.qc')
 
 
 class test_Channel_streaming_reauth:

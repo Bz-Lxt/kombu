@@ -28,6 +28,7 @@ from collections import defaultdict
 from queue import Queue
 
 from . import base, virtual
+from .virtual.exchange import ROUTING_TRACE_KW
 
 
 class Channel(virtual.Channel):
@@ -57,7 +58,14 @@ class Channel(virtual.Channel):
         pass
 
     def _put_fanout(self, exchange, message, routing_key=None, **kwargs):
-        for queue in self._lookup(exchange, routing_key):
+        trace = kwargs.get(ROUTING_TRACE_KW)
+        for queue in self._lookup(exchange, routing_key, default=None):
+            # A queue bound to several fanout exchanges reachable from
+            # the same publish must still receive the message once.
+            if trace is not None:
+                if queue in trace.queues:
+                    continue
+                trace.queues.add(queue)
             self._queue_for(queue).put(message)
 
     def _put(self, queue, message, **kwargs):

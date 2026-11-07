@@ -26,7 +26,8 @@ from kombu.utils.encoding import bytes_to_str, str_to_bytes
 from kombu.utils.scheduling import FairCycle
 from kombu.utils.uuid import uuid
 
-from .exchange import STANDARD_EXCHANGE_TYPES
+from .exchange import (ROUTING_TRACE_KW, STANDARD_EXCHANGE_TYPES,
+                       _public_kwargs)
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -60,6 +61,12 @@ binding_key_t = namedtuple('binding_key_t', (
 #: BrokerState.queue_bindings generates tuples in this format.
 queue_binding_t = namedtuple('queue_binding_t', (
     'exchange', 'routing_key', 'arguments',
+))
+
+#: Key format used for exchange-to-exchange bindings in
+#: BrokerState.exchange_bindings.
+exchange_binding_key_t = namedtuple('exchange_binding_key_t', (
+    'destination', 'source', 'routing_key',
 ))
 
 
@@ -110,15 +117,35 @@ class BrokerState:
     #:     }
     queue_index = None
 
+    #: Registry of exchange-to-exchange bindings, mapping
+    #: ``(destination, source, routing_key)`` to ``arguments``.  Used to
+    #: declare bindings idempotently and to test 'in' relationships in
+    #: constant time.
+    exchange_bindings = None
+
+    #: Maps source exchange names to the set of
+    #: :class:`exchange_binding_key_t` keys leading out of them.
+    exchange_source_index = None
+
+    #: Maps destination exchange names to the set of
+    #: :class:`exchange_binding_key_t` keys leading into them.
+    exchange_destination_index = None
+
     def __init__(self, exchanges=None):
         self.exchanges = {} if exchanges is None else exchanges
         self.bindings = {}
         self.queue_index = defaultdict(set)
+        self.exchange_bindings = {}
+        self.exchange_source_index = defaultdict(set)
+        self.exchange_destination_index = defaultdict(set)
 
     def clear(self):
         self.exchanges.clear()
         self.bindings.clear()
         self.queue_index.clear()
+        self.exchange_bindings.clear()
+        self.exchange_source_index.clear()
+        self.exchange_destination_index.clear()
 
     def has_binding(self, queue, exchange, routing_key):
         return (queue, exchange, routing_key) in self.bindings
@@ -150,6 +177,48 @@ class BrokerState:
             queue_binding_t(key.exchange, key.routing_key, self.bindings[key])
             for key in self.queue_index[queue]
         )
+
+    def has_exchange_binding(self, destination, source, routing_key):
+        return exchange_binding_key_t(
+            destination, source, routing_key,
+        ) in self.exchange_bindings
+
+    def exchange_binding_declare(self, destination, source, routing_key,
+                                 arguments):
+        key = exchange_binding_key_t(destination, source, routing_key)
+        self.exchange_bindings.setdefault(key, arguments)
+        self.exchange_source_index[source].add(key)
+        self.exchange_destination_index[destination].add(key)
+
+    def exchange_binding_delete(self, destination, source, routing_key):
+        """Remove one exchange-to-exchange binding.
+
+        Returns :const:`True` if a binding was removed.
+        """
+        key = exchange_binding_key_t(destination, source, routing_key)
+        try:
+            del self.exchange_bindings[key]
+        except KeyError:
+            return False
+        self.exchange_source_index[source].discard(key)
+        self.exchange_destination_index[destination].discard(key)
+        return True
+
+    def exchange_bindings_purge(self, exchange):
+        """Remove every binding leading out of or into `exchange`.
+
+        Returns a list of ``(key, arguments)`` tuples for the removed
+        bindings.
+        """
+        removed = {}
+        for key in list(self.exchange_source_index.pop(exchange, ())):
+            removed[key] = self.exchange_bindings.pop(key, None)
+            self.exchange_destination_index[key.destination].discard(key)
+        for key in list(self.exchange_destination_index.pop(exchange, ())):
+            if key not in removed:
+                removed[key] = self.exchange_bindings.pop(key, None)
+                self.exchange_source_index[key.source].discard(key)
+        return list(removed.items())
 
 
 class QoS:
@@ -359,6 +428,31 @@ class Message(base.Message):
         }
 
 
+#: Sentinel meaning "no explicit default queue was passed to _lookup".
+_NO_DEFAULT = object()
+
+
+class _RoutingTrace:
+    """Visited nodes of one message routing operation.
+
+    Exchange-to-exchange bindings can form arbitrary topologies, including
+    cycles and diamonds.  A trace is carried through a single
+    :meth:`Channel.basic_publish` to make sure that:
+
+    * every exchange is traversed at most once (cycles terminate),
+    * every destination queue receives the message at most once, even when
+      several paths lead to it,
+    * fanout broadcasts are issued at most once per exchange.
+    """
+
+    __slots__ = ('exchanges', 'queues', 'fanout')
+
+    def __init__(self):
+        self.exchanges = set()
+        self.queues = set()
+        self.fanout = False
+
+
 class AbstractChannel:
     """Abstract channel interface.
 
@@ -529,7 +623,24 @@ class Channel(AbstractChannel, base.StdChannel):
         """Delete `exchange` and all its bindings."""
         for rkey, _, queue in self.get_table(exchange):
             self.queue_delete(queue, if_unused=True, if_empty=True)
+        self._delete_exchange_bindings(exchange)
         self.state.exchanges.pop(exchange, None)
+
+    def _delete_exchange_bindings(self, exchange):
+        """Remove every exchange-to-exchange binding touching `exchange`."""
+        for key, arguments in self.state.exchange_bindings_purge(exchange):
+            meta = self.typeof(key.source).prepare_bind(
+                key.destination, key.source, key.routing_key, arguments,
+            )
+            self._exchange_unbind(key.source, *meta)
+            # Drop the prepared routing row from the source exchange's
+            # local routing table as well (no-op for transports like
+            # Redis that back the table with shared storage).
+            try:
+                table = self.get_exchange_binding_table(key.source)
+            except KeyError:
+                continue
+            table[:] = [row for row in table if row != meta]
 
     def queue_declare(self, queue=None, passive=False, **kwargs):
         """Declare queue."""
@@ -560,11 +671,71 @@ class Channel(AbstractChannel, base.StdChannel):
 
     def exchange_bind(self, destination, source='', routing_key='',
                       nowait=False, arguments=None):
-        raise NotImplementedError('transport does not support exchange_bind')
+        """Bind `destination` exchange to `source` exchange.
+
+        Messages published to `source` that match `routing_key` (using the
+        source exchange's routing rules) are additionally routed into
+        `destination`, where routing continues using the original routing
+        key.  Declaring the same binding more than once has no effect.
+        """
+        self._require_exchange(source)
+        self._require_exchange(destination)
+        if self.state.has_exchange_binding(
+                destination, source, routing_key):
+            return
+        # Add the binding to the shared broker state:
+        self.state.exchange_binding_declare(
+            destination, source, routing_key, arguments,
+        )
+        # Update the source exchange's routing table:
+        meta = self.typeof(source).prepare_bind(
+            destination, source, routing_key, arguments,
+        )
+        self.state.exchanges[source].setdefault(
+            'exchange_bindings', []).append(meta)
+        # Let the transport persist the binding (e.g. in Redis) so that
+        # other connections can reuse the declared topology:
+        self._exchange_bind(source, *meta)
 
     def exchange_unbind(self, destination, source='', routing_key='',
                         nowait=False, arguments=None):
-        raise NotImplementedError('transport does not support exchange_unbind')
+        """Remove an exchange-to-exchange binding.
+
+        Idempotent: unbinding a binding that does not exist does nothing.
+        """
+        # Remove from local state (may be a no-op when the binding was
+        # declared through another connection sharing a broker, e.g. Redis).
+        self.state.exchange_binding_delete(destination, source, routing_key)
+        try:
+            table = self.get_exchange_binding_table(source)
+        except KeyError:
+            return
+        binding_meta = self.typeof(source).prepare_bind(
+            destination, source, routing_key, arguments,
+        )
+        # TODO: the complexity of this operation is O(number of bindings).
+        # Should be optimized.  Modifying table in place.
+        table[:] = [meta for meta in table if meta != binding_meta]
+        self._exchange_unbind(source, *binding_meta)
+
+    def _require_exchange(self, exchange):
+        """Make sure `exchange` has been declared on this broker."""
+        if exchange not in self.state.exchanges:
+            raise ChannelError(
+                'NOT_FOUND - no exchange {!r} in vhost {!r}'.format(
+                    exchange, self.connection.client.virtual_host or '/'),
+                (50, 10), 'Channel.exchange_bind', '404',
+            )
+
+    def _exchange_bind(self, source, routing_key, pattern, destination):
+        """Persist an exchange-to-exchange binding (transport hook)."""
+
+    def _exchange_unbind(self, source, routing_key, pattern, destination):
+        """Remove a persisted exchange-to-exchange binding (transport hook)."""
+
+    def get_exchange_binding_table(self, exchange):
+        """Get table of exchange-to-exchange bindings for `exchange`."""
+        return self.state.exchanges[exchange].get('exchange_bindings', [])
 
     def queue_bind(self, queue, exchange=None, routing_key='',
                    arguments=None, **kwargs):
@@ -614,11 +785,61 @@ class Channel(AbstractChannel, base.StdChannel):
         """Publish message."""
         self._inplace_augment_message(message, exchange, routing_key)
         if exchange:
-            return self.typeof(exchange).deliver(
+            trace = _RoutingTrace()
+            kwargs[ROUTING_TRACE_KW] = trace
+            self._route_to_exchange(
                 message, exchange, routing_key, **kwargs
             )
+            if (not trace.queues and not trace.fanout and
+                    self.deadletter_queue is not None):
+                warnings.warn(UndeliverableWarning(UNDELIVERABLE_FMT.format(
+                    exchange=exchange, routing_key=routing_key)),
+                )
+                self._new_queue(self.deadletter_queue)
+                self._put(
+                    self.deadletter_queue, message,
+                    **_public_kwargs(kwargs),
+                )
+            return
         # anon exchange: routing_key is the destination queue
         return self._put(routing_key, message, **kwargs)
+
+    def _route_to_exchange(self, message, exchange, routing_key, **kwargs):
+        """Deliver one message to `exchange` and recurse into bound exchanges.
+
+        The carried :class:`_RoutingTrace` guarantees that cyclic or
+        multi-path topologies never deliver duplicates: each exchange is
+        traversed once and the exchange types skip queues already reached
+        earlier in the same routing operation.
+        """
+        trace = kwargs[ROUTING_TRACE_KW]
+        if exchange in trace.exchanges:
+            return
+        trace.exchanges.add(exchange)
+        self.typeof(exchange).deliver(
+            message, exchange, routing_key, **kwargs
+        )
+        for destination in self._bound_exchanges(exchange, routing_key):
+            # The message keeps its original routing key; the binding's
+            # routing key was only used to match at the source exchange.
+            self._route_to_exchange(
+                message, destination, routing_key, **kwargs
+            )
+
+    def _bound_exchanges(self, exchange, routing_key):
+        """Find destination exchanges bound to `exchange` matching rkey."""
+        try:
+            table = self.get_exchange_binding_table(exchange)
+        except KeyError:
+            return set()
+        if not table:
+            return set()
+        try:
+            return self.typeof(exchange).lookup(
+                table, exchange, routing_key, None,
+            )
+        except KeyError:
+            return set()
 
     def _inplace_augment_message(self, message, exchange, routing_key):
         message['body'], body_encoding = self.encode_body(
@@ -711,7 +932,7 @@ class Channel(AbstractChannel, base.StdChannel):
             type = default
         return self.exchange_types[type]
 
-    def _lookup(self, exchange, routing_key, default=None):
+    def _lookup(self, exchange, routing_key, default=_NO_DEFAULT):
         """Find all queues matching `routing_key` for the given `exchange`.
 
         Returns
@@ -719,7 +940,7 @@ class Channel(AbstractChannel, base.StdChannel):
             list[str]: queue names -- must return `[default]`
                 if default is set and no queues matched.
         """
-        if default is None:
+        if default is _NO_DEFAULT:
             default = self.deadletter_queue
         if not exchange:  # anon exchange
             return [routing_key or default]

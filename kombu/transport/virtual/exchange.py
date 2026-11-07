@@ -10,6 +10,18 @@ import re
 
 from kombu.utils.text import escape_regex
 
+#: Keyword carrying the routing trace used to deduplicate delivery in
+#: exchange-to-exchange binding topologies (see ``_RoutingTrace`` in
+#: :mod:`kombu.transport.virtual.base`).
+ROUTING_TRACE_KW = '_routing_trace'
+
+
+def _public_kwargs(kwargs):
+    """Strip the internal routing trace before calling ``_put``."""
+    if ROUTING_TRACE_KW in kwargs:
+        return {k: v for k, v in kwargs.items() if k != ROUTING_TRACE_KW}
+    return kwargs
+
 
 class ExchangeType:
     """Base class for exchanges.
@@ -71,8 +83,16 @@ class DirectExchange(ExchangeType):
     def deliver(self, message, exchange, routing_key, **kwargs):
         _lookup = self.channel._lookup
         _put = self.channel._put
-        for queue in _lookup(exchange, routing_key):
-            _put(queue, message, **kwargs)
+        trace = kwargs.get(ROUTING_TRACE_KW)
+        put_kwargs = _public_kwargs(kwargs)
+        for queue in _lookup(exchange, routing_key, default=None):
+            # Skip queues already reached through another path of the
+            # same exchange-to-exchange topology (diamonds/cycles).
+            if trace is not None:
+                if queue in trace.queues:
+                    continue
+                trace.queues.add(queue)
+            _put(queue, message, **put_kwargs)
 
 
 class TopicExchange(ExchangeType):
@@ -101,10 +121,18 @@ class TopicExchange(ExchangeType):
     def deliver(self, message, exchange, routing_key, **kwargs):
         _lookup = self.channel._lookup
         _put = self.channel._put
-        deadletter = self.channel.deadletter_queue
-        for queue in [q for q in _lookup(exchange, routing_key)
-                      if q and q != deadletter]:
-            _put(queue, message, **kwargs)
+        trace = kwargs.get(ROUTING_TRACE_KW)
+        put_kwargs = _public_kwargs(kwargs)
+        for queue in _lookup(exchange, routing_key, default=None):
+            if not queue:
+                continue
+            # Skip queues already reached through another path of the
+            # same exchange-to-exchange topology (diamonds/cycles).
+            if trace is not None:
+                if queue in trace.queues:
+                    continue
+                trace.queues.add(queue)
+            _put(queue, message, **put_kwargs)
 
     def prepare_bind(self, queue, exchange, routing_key, arguments):
         return routing_key, self.key_to_pattern(routing_key), queue
@@ -152,6 +180,15 @@ class FanoutExchange(ExchangeType):
 
     def deliver(self, message, exchange, routing_key, **kwargs):
         if self.channel.supports_fanout:
+            # Mark the broadcast hop so a fanout exchange with no local
+            # subscribers is not mistaken for an unroutable message, and
+            # never broadcast twice when reachable through several paths.
+            trace = kwargs.get(ROUTING_TRACE_KW)
+            if trace is not None:
+                trace.fanout = True
+            # The trace is passed through on purpose: shared-state fanout
+            # implementations (e.g. the memory transport) use it to avoid
+            # enqueueing the same queue twice.
             self.channel._put_fanout(
                 exchange, message, routing_key, **kwargs)
 

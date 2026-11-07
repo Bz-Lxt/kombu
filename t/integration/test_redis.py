@@ -883,6 +883,180 @@ class test_RedisSubclientHealthCheck:
         assert received == [{'msg': 'recovered'}]
 
 
+class test_RedisExchangeCascading:
+    """Exchange-to-exchange bindings shared across Redis connections."""
+
+    def _new_connection(self, connection):
+        # Preserve transport options (e.g. global_keyprefix) from the
+        # parametrized fixture connection.
+        return kombu.Connection(
+            connection.as_uri(),
+            transport_options=connection.transport_options,
+        )
+
+    def _drain_until(self, conn, received, expected, timeout=3.0):
+        deadline = monotonic() + timeout
+        while len(received) < expected and monotonic() < deadline:
+            try:
+                conn.drain_events(timeout=0.2)
+            except socket.timeout:
+                break
+            except Exception:
+                break
+
+    def _consume_quietly(self, conn, seconds=0.8):
+        deadline = monotonic() + seconds
+        while monotonic() < deadline:
+            try:
+                conn.drain_events(timeout=0.2)
+            except socket.timeout:
+                pass
+
+    def _fanout_consumer(self, conn, queue, received):
+        channel = conn.channel()
+        consumer = kombu.Consumer(
+            channel, [queue], accept=['json'], no_ack=True)
+        consumer.register_callback(
+            lambda body, message: received.append(body))
+        consumer.consume()
+        try:
+            conn.drain_events(timeout=0.2)
+        except socket.timeout:
+            pass
+        return channel
+
+    def test_direct_topic_fanout_cascade(self, connection):
+        name = f'cascade_combo_{uuid4().hex}'
+        direct = kombu.Exchange(f'{name}_a', type='direct')
+        topic = kombu.Exchange(f'{name}_b', type='topic')
+        fanout = kombu.Exchange(f'{name}_f', type='fanout')
+        topic_queue = kombu.Queue(
+            f'{name}_qt', exchange=topic, routing_key='news.#')
+        fanout_queue = kombu.Queue(f'{name}_qf', exchange=fanout)
+
+        topic_received, fanout_received = [], []
+
+        with connection as conn:
+            channel = conn.channel()
+            direct(channel).declare()
+            topic(channel).declare()
+            fanout(channel).declare()
+            topic_queue(channel).declare()
+            fanout_queue(channel).declare()
+            # direct -> topic -> fanout
+            channel.exchange_bind(topic.name, direct.name, 'news.us')
+            channel.exchange_bind(fanout.name, topic.name, 'news.#')
+
+            topic_consumer = kombu.Consumer(
+                channel, [topic_queue], accept=['json'], no_ack=True)
+            topic_consumer.register_callback(
+                lambda body, message: topic_received.append(body))
+            topic_consumer.consume()
+            self._fanout_consumer(conn, fanout_queue, fanout_received)
+
+            with self._new_connection(conn) as publisher:
+                kombu.Producer(publisher.channel()).publish(
+                    {'where': 'cascade'}, exchange=direct,
+                    routing_key='news.us', serializer='json', declare=[])
+
+            self._drain_until(conn, topic_received, 1)
+            self._drain_until(conn, fanout_received, 1)
+
+        assert topic_received == [{'where': 'cascade'}]
+        assert fanout_received == [{'where': 'cascade'}]
+
+    def test_cycle_and_multiple_paths_deliver_once(self, connection):
+        name = f'cascade_diamond_{uuid4().hex}'
+        a = kombu.Exchange(f'{name}_a', type='direct')
+        b = kombu.Exchange(f'{name}_b', type='direct')
+        c = kombu.Exchange(f'{name}_c', type='direct')
+        d = kombu.Exchange(f'{name}_d', type='direct')
+        queue_d = kombu.Queue(f'{name}_qd', exchange=d, routing_key='k')
+        queue_b = kombu.Queue(f'{name}_qb', exchange=b, routing_key='k')
+
+        received = []
+        with connection as conn:
+            channel = conn.channel()
+            for exchange in (a, b, c, d):
+                exchange(channel).declare()
+            queue_d(channel).declare()
+            queue_b(channel).declare()
+            # diamond a -> {b, c} -> d
+            channel.exchange_bind(b.name, a.name, 'k')
+            channel.exchange_bind(c.name, a.name, 'k')
+            channel.exchange_bind(d.name, b.name, 'k')
+            channel.exchange_bind(d.name, c.name, 'k')
+            # cycle a <-> b
+            channel.exchange_bind(a.name, b.name, 'k')
+
+            consumer = kombu.Consumer(
+                channel, [queue_d, queue_b], accept=['json'], no_ack=True)
+            consumer.register_callback(
+                lambda body, message: received.append(body))
+            consumer.consume()
+
+            with self._new_connection(conn) as publisher:
+                kombu.Producer(publisher.channel()).publish(
+                    {'path': 'diamond'}, exchange=a, routing_key='k',
+                    serializer='json', declare=[])
+
+            self._drain_until(conn, received, 2)
+            self._consume_quietly(conn)
+
+        assert sorted(received, key=lambda item: item['path']) == [
+            {'path': 'diamond'}, {'path': 'diamond'}]
+
+    def test_unbind_and_redeclare_keep_consistent_delivery(self, connection):
+        name = f'cascade_unbind_{uuid4().hex}'
+        source = kombu.Exchange(f'{name}_a', type='direct')
+        target = kombu.Exchange(f'{name}_b', type='direct')
+        queue = kombu.Queue(f'{name}_q', exchange=target, routing_key='k')
+
+        received = []
+        with connection as conn:
+            channel = conn.channel()
+            source(channel).declare()
+            target(channel).declare()
+            queue(channel).declare()
+            channel.exchange_bind(target.name, source.name, 'k')
+
+            consumer = kombu.Consumer(
+                channel, [queue], accept=['json'], no_ack=True)
+            consumer.register_callback(
+                lambda body, message: received.append(body))
+            consumer.consume()
+
+            with self._new_connection(conn) as publisher:
+                kombu.Producer(publisher.channel()).publish(
+                    {'step': 'bound'}, exchange=source, routing_key='k',
+                    serializer='json', declare=[])
+            self._drain_until(conn, received, 1)
+
+            # Unbind through a different connection.
+            with self._new_connection(conn) as other:
+                other.channel().exchange_unbind(
+                    target.name, source.name, 'k')
+                kombu.Producer(other.channel()).publish(
+                    {'step': 'unbound'}, exchange=source, routing_key='k',
+                    serializer='json', declare=[])
+            self._consume_quietly(conn)
+            assert received == [{'step': 'bound'}]
+
+            # Redeclaring the topology from yet another connection
+            # restores the same delivery result.
+            with self._new_connection(conn) as third:
+                third_chan = third.channel()
+                third_chan.exchange_declare(source.name, 'direct')
+                third_chan.exchange_declare(target.name, 'direct')
+                third_chan.exchange_bind(target.name, source.name, 'k')
+                kombu.Producer(third_chan).publish(
+                    {'step': 'rebound'}, exchange=source, routing_key='k',
+                    serializer='json', declare=[])
+            self._drain_until(conn, received, 2)
+
+        assert received == [{'step': 'bound'}, {'step': 'rebound'}]
+
+
 class _LegacySentinelChannel(Channel):
     """Behave like the ``SentinelChannel`` of kombu < 5.4.0.
 

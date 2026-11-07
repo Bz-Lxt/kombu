@@ -36,6 +36,41 @@ def test_BrokerState():
     assert t.exchanges == 16
 
 
+def test_BrokerState_exchange_bindings():
+    state = virtual.BrokerState()
+    assert not state.has_exchange_binding('b', 'a', 'k')
+
+    state.exchange_binding_declare('b', 'a', 'k', {'x': 1})
+    # Declaring the same binding is idempotent.
+    state.exchange_binding_declare('b', 'a', 'k', {'x': 2})
+    assert state.has_exchange_binding('b', 'a', 'k')
+    assert state.exchange_bindings[
+        virtual.exchange_binding_key_t('b', 'a', 'k')] == {'x': 1}
+
+    removed = dict(state.exchange_bindings_purge('a'))
+    assert virtual.exchange_binding_key_t('b', 'a', 'k') in removed
+    assert not state.exchange_bindings
+    assert not state.exchange_source_index['a']
+    assert not state.exchange_destination_index['b']
+
+    # Purging a self-loop binding removes it only once.
+    state.exchange_binding_declare('x', 'x', 'loop', None)
+    assert len(state.exchange_bindings_purge('x')) == 1
+    assert not state.exchange_bindings
+    assert not state.exchange_source_index['x']
+    assert not state.exchange_destination_index['x']
+
+
+def test_BrokerState_exchange_binding_delete():
+    state = virtual.BrokerState()
+    state.exchange_binding_declare('b', 'a', 'k', None)
+    assert state.exchange_binding_delete('b', 'a', 'k')
+    assert not state.exchange_binding_delete('b', 'a', 'k')
+    assert not state.exchange_bindings
+    assert not state.exchange_source_index['a']
+    assert not state.exchange_destination_index['b']
+
+
 class test_QoS:
 
     def setup_method(self):
@@ -197,13 +232,36 @@ class test_Channel:
         with pytest.raises(ResourceError):
             channel._get_free_channel_id()
 
-    def test_exchange_bind_interface(self):
-        with pytest.raises(NotImplementedError):
+    def test_exchange_bind_requires_declared_exchanges(self):
+        with pytest.raises(ChannelError):
             self.channel.exchange_bind('dest', 'src', 'key')
 
-    def test_exchange_unbind_interface(self):
-        with pytest.raises(NotImplementedError):
-            self.channel.exchange_unbind('dest', 'src', 'key')
+        self.channel.exchange_declare(exchange='src', type='direct')
+        with pytest.raises(ChannelError):
+            self.channel.exchange_bind('dest', 'src', 'key')
+
+    def test_exchange_bind_and_unbind(self):
+        c = self.channel
+        c.exchange_declare(exchange='src', type='direct')
+        c.exchange_declare(exchange='dest', type='topic')
+
+        assert not c.state.has_exchange_binding('dest', 'src', 'key')
+        c.exchange_bind('dest', 'src', 'key')
+        assert c.state.has_exchange_binding('dest', 'src', 'key')
+        assert c.get_exchange_binding_table('src') == [
+            ('key', None, 'dest')]
+
+        # Declaring the same binding again is idempotent.
+        c.exchange_bind('dest', 'src', 'key')
+        assert c.get_exchange_binding_table('src') == [
+            ('key', None, 'dest')]
+
+        c.exchange_unbind('dest', 'src', 'key')
+        assert not c.state.has_exchange_binding('dest', 'src', 'key')
+        assert c.get_exchange_binding_table('src') == []
+
+        # Unbinding a binding that does not exist does not raise.
+        c.exchange_unbind('dest', 'src', 'key')
 
     def test_queue_unbind_interface(self):
         self.channel.queue_unbind('dest', 'ex', 'key')
